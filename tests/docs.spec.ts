@@ -7,6 +7,8 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const NUMBERED = /^(\d{3})-[a-z0-9-]+\.md$/
 const numbered = readdirSync(join(ROOT, 'docs')).filter(name => NUMBERED.test(name)).sort()
 const entries = ['README.md', 'SETUP.md']
+const translated = [...entries, ...numbered.map(name => `docs/${name}`)]
+const siblingOf = (path: string): string => path.replace(/\.md$/, '_zh.md')
 const documents = [...entries, ...readdirSync(join(ROOT, 'docs')).filter(name => name.endsWith('.md')).map(name => `docs/${name}`)]
 const read = (path: string): string => readFileSync(join(ROOT, path), 'utf8')
 function links(file: string): string[] {
@@ -31,6 +33,74 @@ function listed(heading: string): string[] {
       directory = dirname(name!)
       return name!
     })
+  })
+}
+/** Lines outside fenced code blocks. Fence markers themselves are omitted. */
+function prose(text: string): string[] {
+  const lines: string[] = []
+  let fenced = false
+  for (const line of text.split('\n')) {
+    if (line.startsWith('```')) {
+      fenced = !fenced
+      continue
+    }
+    if (!fenced) lines.push(line)
+  }
+  return lines
+}
+/** Fenced blocks in order, each including its opening and closing markers. */
+function fences(text: string): string[] {
+  const blocks: string[] = []
+  let block: string[] | undefined
+  for (const line of text.split('\n')) {
+    if (!block && line.startsWith('```')) {
+      block = [line]
+      continue
+    }
+    if (!block) continue
+    block.push(line)
+    if (line.startsWith('```')) {
+      blocks.push(block.join('\n'))
+      block = undefined
+    }
+  }
+  return blocks
+}
+function headingLevels(text: string): number[] {
+  return prose(text).flatMap(line => {
+    const match = /^(#{1,6}) /.exec(line)
+    return match ? [match[1]!.length] : []
+  })
+}
+/** Term / 中文 pairs from the glossary table in the English domain document. */
+function glossaryPairs(text: string): [string, string][] {
+  const lines = text.split('\n')
+  const start = lines.indexOf('## Glossary')
+  const pairs: [string, string][] = []
+  let headers: string[] | undefined
+  for (const line of lines.slice(start + 1)) {
+    if (line.startsWith('## ')) break
+    if (!line.startsWith('|')) {
+      if (headers) break
+      continue
+    }
+    const cells = line.split('|').slice(1, -1).map(cell => cell.trim())
+    if (cells.every(cell => /^:?-+:?$/.test(cell))) continue
+    if (!headers) {
+      headers = cells
+      continue
+    }
+    const term = cells[headers.indexOf('Term')]
+    const zh = cells[headers.indexOf('中文')]
+    if (term && zh) pairs.push([term, zh])
+  }
+  return pairs
+}
+function tableRows(text: string): string[][] {
+  return text.split('\n').flatMap(line => {
+    if (!line.startsWith('|')) return []
+    const cells = line.split('|').slice(1, -1).map(cell => cell.trim())
+    return cells.every(cell => /^:?-+:?$/.test(cell)) ? [] : [cells]
   })
 }
 
@@ -64,5 +134,65 @@ describe('documentation', () => {
     const tests = listed('Tests')
     expect(files('tests').filter(path => /\.spec\.tsx?$/.test(path) && !tests.includes(path))).toEqual([])
     expect(tests.filter(path => !existsSync(join(ROOT, path)))).toEqual([])
+  })
+  it('gives every project document a Chinese sibling', () => {
+    expect(translated).toEqual([
+      'README.md', 'SETUP.md',
+      'docs/000-philosophy.md', 'docs/001-domain.md', 'docs/002-authorization.md', 'docs/003-execution.md',
+      'docs/004-prompts.md', 'docs/005-panel.md', 'docs/006-deployment.md', 'docs/007-architecture.md', 'docs/008-cookbook.md',
+    ])
+    expect(translated.filter(path => !existsSync(join(ROOT, siblingOf(path))))).toEqual([])
+  })
+  it('keeps Chinese heading levels and fenced code aligned with the English source', () => {
+    const mismatches = translated.flatMap(path => {
+      const zh = siblingOf(path)
+      if (!existsSync(join(ROOT, zh))) return [`${zh} missing`]
+      const english = read(path)
+      const chinese = read(zh)
+      const problems: string[] = []
+      if (headingLevels(chinese).join() !== headingLevels(english).join()) problems.push(`${zh} headings`)
+      if (fences(chinese).join('\n---\n') !== fences(english).join('\n---\n')) problems.push(`${zh} fences`)
+      return problems
+    })
+    expect(mismatches).toEqual([])
+  })
+  it('uses more Han characters than Latin letters outside fenced code', () => {
+    const short = translated.flatMap(path => {
+      const zh = siblingOf(path)
+      if (!existsSync(join(ROOT, zh))) return [`${zh} missing`]
+      const body = prose(read(zh)).join('\n')
+      const han = body.match(/\p{Script=Han}/gu)?.length ?? 0
+      const latin = body.match(/[A-Za-z]/g)?.length ?? 0
+      return han > latin ? [] : [`${zh} han ${han} latin ${latin}`]
+    })
+    expect(short).toEqual([])
+  })
+  it('keeps the 001 glossary term and 中文 pairs', () => {
+    const pairs = glossaryPairs(read('docs/001-domain.md'))
+    expect(pairs.length).toBeGreaterThan(0)
+    const zh = 'docs/001-domain_zh.md'
+    if (!existsSync(join(ROOT, zh))) {
+      expect(zh).toBe('present')
+      return
+    }
+    const rows = tableRows(read(zh))
+    expect(pairs.filter(([term, name]) => !rows.some(cells => cells.includes(term) && cells.includes(name)))).toEqual([])
+  })
+  it('points Chinese documents at Chinese siblings and resolves their links', () => {
+    const problems = translated.flatMap(path => {
+      const zh = siblingOf(path)
+      if (!existsSync(join(ROOT, zh))) return [`${zh} missing`]
+      return links(join(ROOT, zh)).flatMap(target => {
+        const absolute = resolve(dirname(join(ROOT, zh)), target)
+        if (!existsSync(absolute)) return [`${zh} → ${target} missing`]
+        const rel = relative(ROOT, absolute)
+        return translated.includes(rel) ? [`${zh} → ${target} should be the _zh sibling`] : []
+      })
+    })
+    expect(problems).toEqual([])
+  })
+  it('leaves no merge conflict markers in Chinese documents', () => {
+    const marked = translated.map(siblingOf).filter(path => existsSync(join(ROOT, path)) && /^(<{7}|>{7}) /m.test(read(path)))
+    expect(marked).toEqual([])
   })
 })
